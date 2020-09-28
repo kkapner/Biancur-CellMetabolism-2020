@@ -1,0 +1,455 @@
+---
+title: "Bulk RNA-seq Analysis"
+output: 
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+This notebook provides the analysis of the RNA-seq data provided by Novogene.
+
+
+# Data Loading and Pre-Processing
+
+## Loading Data
+```{r message = FALSE}
+library("DESeq2")
+```
+
+```{r}
+counts <- as.matrix(read.csv("../data/RNA-seq/BiancurCollab-2019-ReadCounts-Swapped.csv", row.names = "geneID"))
+coldata <- read.csv("../data/RNA-seq/BiancurCollab-2019-Annotations_Swapped.csv", sep = "\t", row.names = 1)
+all(rownames(coldata) == colnames(counts))
+```
+
+Loading the counts and creating the DESeq object. A pre-filtering step is performed to remove genes which have total counts < 10 summed across all samples.
+
+```{r message = FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = coldata,
+                              design = ~ group)
+dds <- DESeq(dds)
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+```
+
+## Transforming Raw Read Counts
+
+Transforming using rlog function. Two transformations will be done. One with blind = TRUE (used for QC metrics) and one with blind = FALSE (can be used for other downstream analyses. This is data in the file which is saved as rlog-Transformed-Readcounts.csv).
+
+```{r message = FALSE}
+rlogcounts_qc <- rlog(dds, blind = TRUE)
+rlogcounts_downstream <- rlog(dds, blind = FALSE)
+```
+
+Saving these transformed values for future reference.
+
+```{r}
+write.csv(assay(rlogcounts_downstream), "../output/rna-seq/DEG/20200131Design/3D/rlog-Trasnformed-Readcounts.csv", quote = FALSE, row.names = TRUE)
+```
+
+# Data QC
+
+## Transformed Count Matrix
+
+Here we create a plot demonstrating the mean-variance relationship in the non-regularized log2(count + 1) and in the regularized log (rlog) normalized counts. We can see that the the mean-variance relationship is essentially removed by applying the rlog transformation.
+
+```{r}
+library("pheatmap")
+library("vsn")
+pdf("../output/rna-seq/figures/MeanSdPlot-NormTransform.pdf")
+meanSdPlot(assay(normTransform(dds))) 
+dev.off()
+
+pdf("../output/rna-seq/figures/MeanSdPlot-RlogCounts.pdf")
+meanSdPlot(assay(rlogcounts_qc))
+dev.off()
+```
+
+## Sample-to-Sample Distances
+
+Here we create a heatmap of the sample to sample distances.
+
+```{r, message = FALSE}
+library("RColorBrewer")
+sample_distances <- dist(t(assay(rlogcounts_qc)))
+sample_distances_matrix <- as.matrix(sample_distances)
+rownames(sample_distances_matrix) <- paste(rlogcounts_qc$culture, rlogcounts_qc$genotype, rlogcounts_qc$sample_num, sep = "-")
+colnames(sample_distances_matrix) <- paste(rlogcounts_qc$culture, rlogcounts_qc$genotype, rlogcounts_qc$sample_num, sep = "-")
+colors <- colorRampPalette(rev(brewer.pal(9, "Oranges")))(255)
+pheatmap(sample_distances_matrix,
+         clustering_distance_rows = sample_distances,
+         clustering_distance_cols = sample_distances,
+         col = colors)
+```
+
+
+## Sample-to-Sample Correlation
+
+Here we create a heatmap of the correlations between each of the samples. As expected, it is the reverse of the sample-to-sample distances, as a low sample distance implies greater correlation. We can see that all samples correlate well with eachother.
+
+```{r}
+correlation <- round(cor(assay(rlogcounts_qc)), 3)
+rownames(correlation) <- paste(rlogcounts_qc$culture, rlogcounts_qc$genotype, rlogcounts_qc$sample_num, sep = "-")
+colnames(correlation) <- paste(rlogcounts_qc$culture, rlogcounts_qc$genotype, rlogcounts_qc$sample_num, sep = "-")
+colors <- colorRampPalette(brewer.pal(9, "Oranges"))(1000)
+pdf("../output/rna-seq/figures/Sample-Correlation.pdf")
+pheatmap(correlation,  
+         clustering_distance_rows = sample_distances,
+         clustering_distance_cols = sample_distances,
+         col = colors, breaks = seq(0.8, 1, length.out = 1000),
+         legend = TRUE, legend_labels = c("Pearson Correlation"))
+dev.off()
+```
+
+## PCA
+
+Here we create a PCA plot fo the samples to illustrate any potential batch effects.
+
+```{r warning = FALSE}
+library("ggplot2")
+pca <- plotPCA(rlogcounts_qc, intgroup = c("culture", "genotype", "sample_num"), returnData = TRUE)
+percentVar <- round(100 * attr(pca, "percentVar"))
+
+pdf("../output/rna-seq/figures/PCA-Culture-Genotype.pdf")
+ggplot(pca, aes(PC1, PC2, color = culture, shape = genotype, label = sample_num)) +
+  geom_point(size = 3) + 
+  geom_text(vjust = -0.5, hjust = -0.3, size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  scale_color_manual(values = c("#999999", "#E69F00", "#56B4E9"))
+dev.off()
+```
+
+
+# Differential Expression Analysis
+
+Here we define a function to perfrom the differential expression analysis on the provided contrast. The default parameters will be used for all comparisons.
+
+```{r}
+comparison_results <- function(dds, contrast, alpha = 0.05, padj = "BH", type = "ashr"){
+  contrast_res <- results(dds, contrast, alpha = alpha, pAdjustMethod =  padj)
+  shrunk_lfc <- lfcShrink(dds, contrast = contrast, type = type)
+  ordered_shrunk_lfc <- shrunk_lfc[order(shrunk_lfc$pvalue), ]
+  return(ordered_shrunk_lfc)
+}
+```
+
+## Culture Condition Comparisons
+
+Here we perform differential expression analysis for each of the different culture conditions (Tumor, 2D, or 3D) for each of the genotype conditoins (WT, KO_1, KO_2).
+
+```{r message = FALSE, eval = FALSE}
+wt_t_2d <- comparison_results(dds, c("group", "WT_T", "WT_2D"))
+wt_t_3d <- comparison_results(dds, c("group", "WT_T", "WT_3D"))
+wt_3d_2d <- comparison_results(dds, c("group", "WT_3D", "WT_2D"))
+
+dir.create("../output/rna-seq/DEG/WT/", recursive = TRUE)
+write.csv(as.data.frame(wt_t_2d), "../output/rna-seq/DEG/WT/WT_T_2D_results.csv")
+write.csv(wt_t_3d, "../output/rna-seq/DEG/WT/WT_T_3D_results.csv")
+write.csv(wt_3d_2d, "../output/rna-seq/DEG/WT/WT_3D_2D_results.csv")
+
+ko1_t_2d <- comparison_results(dds, c("group", "KO_1_T", "KO_1_2D"))
+ko1_t_3d <- comparison_results(dds, c("group", "KO_1_T", "KO_1_3D"))
+ko1_3d_2d <- comparison_results(dds, c("group", "KO_1_3D", "KO_1_2D"))
+
+dir.create("../output/rna-seq/DEG/KO1/", recursive = TRUE)
+write.csv(ko1_t_2d, "../output/rna-seq/DEG/KO1/KO1_T_2D_results.csv")
+write.csv(ko1_t_3d, "../output/rna-seq/DEG/KO1/KO1_T_3D_results.csv")
+write.csv(ko1_3d_2d, "../output/rna-seq/DEG/KO1/KO1_3D_2D_results.csv")
+
+ko2_t_2d <- comparison_results(dds, c("group", "KO_2_T", "KO_2_2D"))
+ko2_t_3d <- comparison_results(dds, c("group", "KO_2_T", "KO_2_3D"))
+ko2_3d_2d <- comparison_results(dds, c("group", "KO_2_3D", "KO_2_2D"))
+
+dir.create("../output/rna-seq/DEG/KO2/", recursive = TRUE)
+write.csv(ko2_t_2d, "../output/rna-seq/DEG/KO2/KO2_T_2D_results.csv")
+write.csv(ko2_t_3d, "../output/rna-seq/DEG/KO2/KO2_T_3D_results.csv")
+write.csv(ko2_3d_2d, "../output/rna-seq/DEG/KO2/KO2_3D_2D_results.csv")
+```
+
+## Genotype Condition Comparisons
+
+Here we perform differential expression analysis by comparing the knockoout to the wild type for each culture condition. 
+
+```{r message = FALSE, warning = FALSE, eval = FALSE}
+# ko1_wt_t <- comparison_results(dds, c("group", "KO_1_T", "WT_T"))
+# ko2_wt_t <- comparison_results(dds, c("group", "KO_2_T", "WT_T"))
+# 
+# dir.create("../output/rna-seq/DEG/Tumor/", recursive = TRUE)
+# write.csv(ko1_wt_t, "../output/rna-seq/DEG/Tumor/KO1_WT_T_results.csv")
+# write.csv(ko2_wt_t, "../output/rna-seq/DEG/Tumor/KO2_WT_T_results.csv")
+# 
+# ko1_wt_2d <- comparison_results(dds, c("group", "KO_1_2D", "WT_2D"))
+# ko2_wt_2d <- comparison_results(dds, c("group", "KO_2_2D", "WT_2D"))
+# 
+# dir.create("../output/rna-seq/DEG/2D/", recursive = TRUE)
+# write.csv(ko1_wt_2d, "../output/rna-seq/DEG/2D/KO1_WT_2D_results.csv")
+# write.csv(ko2_wt_2d, "../output/rna-seq/DEG/2D/KO2_WT_2D_results.csv")
+
+ko1_wt_3d <- comparison_results(dds, c("group", "KO_1_3D", "WT_3D"))
+ko2_wt_3d <- comparison_results(dds, c("group", "KO_2_3D","WT_3D"))
+
+dir.create("/Users/kevinkapner/Documents/Projects/KimmelmanNYU_2019_copy/output/rna-seq/DEG/20200131Design/3D/", recursive = TRUE)
+write.csv(ko1_wt_3d, "/Users/kevinkapner/Documents/Projects/KimmelmanNYU_2019_copy/output/rna-seq/DEG/20200131Design/3D/KO1_WT_3D_results.csv")
+write.csv(ko2_wt_3d, "/Users/kevinkapner/Documents/Projects/KimmelmanNYU_2019_copy/output/rna-seq/DEG/20200131Design/3D/KO2_WT_3D_results.csv")
+```
+
+```{r}
+library("EnhancedVolcano")
+
+EnhancedVolcano(wt_3d_2d,
+  lab = rownames(wt_3d_2d),
+  x = 'log2FoldChange',
+  y = 'padj',
+  xlim = c(-5, 8))
+```
+
+# Gene Set Enrichment Analysis
+
+**Note** *The gene IDs need to be the official gene symbols and not EnsemblIDs. Furthermore, these EnsemblIDs correspond to mouse genes and thus they need to be converted to their human ortholog. This is done using the bioDBnet database and the EnsemblToSymbol.py python script. This should be done before running anything below.*
+
+We can run GSEA on the multiple comparisons using the fgsea package. This package requires that the input be a named vector with genes as names and values as the gene statistic. For comparisons between groups, this will be the difference between the two groups taken in the order they are listed. For example, Enrichment Analysis on WT_T vs WT_2D will be WT_T - WT_2D for the given LFC values. Positive values will be values more enriched in Tumor than 2D and negative values will be genes more depleted in Tumor than in 2D. The reverse (enriched in 2D vs Tumor) can just be found by multiplying the list by -1 and rerunning.
+
+The first set of pairwise comparisons to make are the genotype matched conditions:
+
+* WT_Tumor vs WT_2D
+* WT_Tumor vs WT_3D
+* WT_3D vs WT_2D
+* KO_1_Tumor vs KO_1_2D
+* KO_1_Tumor vs KO_1_3D
+* KO_1_3D vs KO_1_2D
+* KO_2_Tumor vs KO_2_2D
+* KO_2_Tumor vs KO_2_3D
+* KO_2_3D vs KO_2_2D
+
+Here we define a function to run GSEA and return the results.
+
+```{r message = FALSE}
+library("fgsea")
+library("dplyr")
+
+run_gsea <- function(data.path, geneset.path, padj.cutoff = 1, decreasing = FALSE){
+  deg.data <- read.csv(data.path)
+  deg.data <- dplyr::filter(deg.data, padj < padj.cutoff)
+  deg.data <- deg.data[, c("HumanSymbol", "log2FoldChange")]
+  
+  # Mulitple ensembl IDs may map to the same gene, so the average log2foldchange is taken as the representative value for GSEA
+  deg.data <- aggregate(log2FoldChange ~ HumanSymbol, data = deg.data, FUN = mean) 
+  deg.data.vector <- deg.data[, "log2FoldChange"]
+  names(deg.data.vector) <- deg.data[, "HumanSymbol"]
+  deg.data.vector <- sort(deg.data.vector, decreasing = decreasing)
+
+  gene.sets <- gmtPathways(geneset.path)
+  fgseaResults <- fgsea(gene.sets, deg.data.vector, minSize = 15, maxSize = 500, nperm = 5000)
+  fgseaResults <- fgseaResults[order(pval), ]
+  
+  results <- list(fgseaResults, deg.data.vector, gene.sets)
+  names(results) <- c("FGSEA", "DEG.Vector", "Gene.Sets")
+  return(results)
+  
+}
+
+res <- run_gsea("../output/rna-seq/DEG/WT/WT_T_2D_results.csv", "../data/RNA-seq/20200116_gene-sets/go.kegg.biocarta.reactome.hallmark.symbols.gmt")
+
+head(res[["FGSEA"]], 400)
+plotEnrichment(res[["Gene.Sets"]][["GO_GROWTH_FACTOR_ACTIVITY"]],
+               res[["DEG.Vector"]]) + labs(title = "Growth Factor Activity")
+```
+
+We can now run GSEA on all of the conditions and save the results in the corresponding folder.
+
+```{r warning = FALSE, message = FALSE}
+library(data.table)
+
+deg_paths <- c("../output/rna-seq/DEG/WT/WT_T_2D_results.csv", "../output/rna-seq/DEG/WT/WT_T_3D_results.csv",
+               "../output/rna-seq/DEG/WT/WT_3D_2D_results.csv", "../output/rna-seq/DEG/KO1/KO1_T_2D_results.csv",
+               "../output/rna-seq/DEG/KO1/KO1_T_3D_results.csv", "../output/rna-seq/DEG/KO1/KO1_3D_2D_results.csv",
+               "../output/rna-seq/DEG/KO2/KO2_T_2D_results.csv", "../output/rna-seq/DEG/KO2/KO2_T_3D_results.csv",
+               "../output/rna-seq/DEG/KO2/KO2_3D_2D_results.csv", "../output/rna-seq/DEG/Tumor/KO1_WT_T_results.csv",
+               "../output/rna-seq/DEG/Tumor/KO2_WT_T_results.csv", "../output/rna-seq/DEG/2D/KO1_WT_2D_results.csv",
+               "../output/rna-seq/DEG/2D/KO2_WT_2D_results.csv", "../output/rna-seq/DEG/3D/KO1_WT_3D_results.csv",
+               "../output/rna-seq/DEG/3D/KO2_WT_3D_results.csv")
+
+gene.set.path <- c("KEGG" = "../data/RNA-seq/20200116_gene-sets/c2.cp.kegg.v7.0.symbols.gmt",
+                   "BIOCARTA" = "../data/RNA-seq/20200116_gene-sets/c2.cp.biocarta.v7.0.symbols.gmt",
+                   "REACTOME" = "../data/RNA-seq/20200116_gene-sets/c2.cp.reactome.v7.0.symbols.gmt",
+                   "HALLMARK" = "../data/RNA-seq/20200116_gene-sets/h.all.v7.0.symbols.gmt",
+                   "CURATED" = "../data/RNA-seq/20200116_gene-sets/c2.all.v7.0.symbols.gmt",
+                   "GO" = "../data/RNA-seq/20200116_gene-sets/go.c5.all.v7.0.symbols.gmt")
+
+for (set in names(gene.set.path)){
+  for (path in deg_paths) {
+    res <- run_gsea(path, gene.set.path[set])
+    condition <- basename(dirname(path))
+    folder <- file.path("../output/rna-seq/", "GSEA", set, condition)
+    dir.create(folder, recursive = TRUE)
+    fwrite(res[["FGSEA"]], file = file.path(folder, gsub("_results.csv", "_GSEA.txt", basename(path))), sep = "\t",
+           sep2 = c("", " ", ""))
+  }
+}
+```
+
+We can now make the second set of comparisons. These will be between KO vs WT for each of the different culture conditions. For example,
+2Dvs3D_1 will be the difference between the log2FoldChange of 2D (KO_1 vs WT) and the log2FoldChange of 3D (KO_1 vs WT). These enrichment can then be interpreted as identifying patheways which are enriched in 2D when FDFT1 is knocked out relative to nromal in comparison to 3D.
+
+An added layer of complexity to this analysis that the significant genes in one list may not correspond to the significant genes in another list, thus the filtering step by padj becomes complicated. A way to get around this is to find all of the differences between significant genes (padj < 0.10) on both lists and then use that entire list of differences as the input to the GSEA. This process will remove genes which do not show significant changes in either condition and thus can be focused on the genes of interest. 
+
+The comparisons to make are:
+
+* Tumor vs 2D
+* Tumor vs 3D
+* 3D vs 2D
+
+
+```{r, eval = TRUE}
+# Tumor vs 2D case
+calc_condition_difference <- function(cond1.path, cond2.path){
+  cond1 <- read.csv(cond1.path, stringsAsFactors = FALSE)
+  cond2 <- read.csv(cond2.path, stringsAsFactors = FALSE)
+  
+  significant.genes <- c(dplyr::filter(cond1, padj < 0.25)[, "Unnamed..0"],
+                         dplyr::filter(cond2, padj < 0.25)[, "Unnamed..0"])
+  
+  cond1_vs_cond2 <- data.frame("EnsemblID" = significant.genes)
+  cond1_vs_cond2[, "log2FoldChange"] <- NA
+  cond1_vs_cond2[, "HumanSymbol"] <- NA
+  cond1_vs_cond2[, "padj"] <- 0.25
+  
+  for (gene in significant.genes) {
+    row.idx <- which(cond1_vs_cond2$EnsemblID == gene)
+    cond1_vs_cond2[row.idx, "log2FoldChange"] <- cond1[which(cond1$Unnamed..0 == gene), "log2FoldChange"] - 
+      cond2[which(cond2$Unnamed..0 == gene), "log2FoldChange"]
+    cond1_vs_cond2[row.idx, "HumanSymbol"] <- cond1[which(cond1$Unnamed..0 == gene), "HumanSymbol"]
+  }
+  
+  return(cond1_vs_cond2)
+}
+
+diff_tumor_vs_2d_ko1 <- calc_condition_difference("../output/rna-seq/DEG/Tumor/KO1_WT_T_results.csv", 
+                                         "../output/rna-seq/DEG/2D/KO1_WT_2D_results.csv")
+diff_tumor_vs_2d_ko2 <- calc_condition_difference("../output/rna-seq/DEG/Tumor/KO2_WT_T_results.csv", 
+                                         "../output/rna-seq/DEG/2D/KO2_WT_2D_results.csv")
+dir.create("../output/rna-seq/DEG/Tv2D", recursive = TRUE)
+write.csv(diff_tumor_vs_2d_ko1, "../output/rna-seq/DEG/Tv2D/Tvs2D_KO1_results.csv")
+write.csv(diff_tumor_vs_2d_ko2, "../output/rna-seq/DEG/Tv2D/Tvs2D_KO2_results.csv")
+
+
+diff_tumor_vs_3d_ko1 <-  calc_condition_difference("../output/rna-seq/DEG/Tumor/KO1_WT_T_results.csv", 
+                                         "../output/rna-seq/DEG/3D/KO1_WT_3D_results.csv")
+diff_tumor_vs_3d_ko2 <-  calc_condition_difference("../output/rna-seq/DEG/Tumor/KO2_WT_T_results.csv", 
+                                         "../output/rna-seq/DEG/3D/KO2_WT_3D_results.csv")
+dir.create("../output/rna-seq/DEG/Tv3D", recursive = TRUE)
+write.csv(diff_tumor_vs_3d_ko1, "../output/rna-seq/DEG/Tv3D/Tvs3D_KO1_results.csv")
+write.csv(diff_tumor_vs_3d_ko2, "../output/rna-seq/DEG/Tv3D/Tvs3D_KO2_results.csv")
+
+diff_3d_vs_2d_ko1 <- calc_condition_difference("../output/rna-seq/DEG/3D/KO1_WT_3D_results.csv",
+                                               "../output/rna-seq/DEG/2D/KO1_WT_2D_results.csv")
+diff_3d_vs_2d_ko2 <- calc_condition_difference("../output/rna-seq/DEG/3D/KO2_WT_3D_results.csv",
+                                               "../output/rna-seq/DEG/2D/KO2_WT_2D_results.csv")
+dir.create("../output/rna-seq/DEG/3Dv2D", recursive = TRUE)
+write.csv(diff_3d_vs_2d_ko1, "../output/rna-seq/DEG/3Dv2D/3Dvs2D_KO1_results.csv")
+write.csv(diff_3d_vs_2d_ko2, "../output/rna-seq/DEG/3Dv2D/3Dvs2D_KO2_results.csv")
+
+```
+
+Now GSEA can be run on each of these sets.
+
+```{r message = FALSE, warning = FALSE}
+diff.deg.paths <- c("../output/rna-seq/DEG/Tv2D/Tvs2D_KO1.csv", "../output/rna-seq/DEG/Tv2D/Tvs2D_KO2.csv",
+                    "../output/rna-seq/DEG/Tv3D/Tvs3D_KO1.csv", "../output/rna-seq/DEG/Tv3D/Tvs3D_KO2.csv",
+                    "../output/rna-seq/DEG/3Dv2D/3Dvs2D_KO1.csv", "../output/rna-seq/DEG/3Dv2D/3Dvs2D_KO2.csv")
+
+gene.set.path <- c("KEGG" = "../data/RNA-seq/20200116_gene-sets/c2.cp.kegg.v7.0.symbols.gmt",
+                   "BIOCARTA" = "../data/RNA-seq/20200116_gene-sets/c2.cp.biocarta.v7.0.symbols.gmt",
+                   "REACTOME" = "../data/RNA-seq/20200116_gene-sets/c2.cp.reactome.v7.0.symbols.gmt",
+                   "HALLMARK" = "../data/RNA-seq/20200116_gene-sets/h.all.v7.0.symbols.gmt",
+                   "CURATED" = "../data/RNA-seq/20200116_gene-sets/c2.all.v7.0.symbols.gmt",
+                   "GO" = "../data/RNA-seq/20200116_gene-sets/go.c5.all.v7.0.symbols.gmt")
+
+for (set in names(gene.set.path)){
+  for (path in diff.deg.paths) {
+    res <- run_gsea(path, gene.set.path[set])
+    condition <- basename(dirname(path))
+    folder <- file.path("../output/rna-seq/", "GSEA", set, condition)
+    dir.create(folder, recursive = TRUE)
+    fwrite(res[["FGSEA"]], file = file.path(folder, gsub(".csv", "_GSEA.txt", basename(path))), sep = "\t",
+           sep2 = c("", " ", ""))
+  }
+}
+```
+
+```{r echo = FALSE, eval = FALSE}
+topPathwaysUp <- res[[1]][ES > 0][head(order(pval), n = 10), pathway]
+topPathwaysDown <- res[[1]][ES < 0][head(order(pval), n = 10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+
+# This works! Combine the plotEnrichment function and this function into one and then you should be able to recreate the replot package to make plots for any specific gene set.
+pdf("/Users/kevinkapner/Documents/TestPlot.pdf")
+plotGseaTable(res[[3]][topPathways], res[[2]], res[[1]], gseaParam = 0.5, render = TRUE)
+dev.off()
+```
+
+We will now find the overlap between the 3D KO2 vs WT condition and the In-Vivo dependencies.   
+
+
+```{r}
+rna.seq.3d <- read.csv("../output/rna-seq/DEG/3D/KO2_WT_3D_results.csv", stringsAsFactors = FALSE)
+invivo.dependencies <- read.csv("../output/stars/individual/STARS-with-Median-LFC-B6.csv", stringsAsFactors = FALSE)
+
+rna.seq.3d <- dplyr::filter(rna.seq.3d, padj < 0.05)[, "HumanSymbol"]
+invivo.dependencies <- toupper(dplyr::filter(invivo.dependencies, q.value < 0.05)[, "Gene.Symbol"])
+intersect(rna.seq.3d, invivo.dependencies)
+
+length(rna.seq.3d)
+length(invivo.dependencies)
+```
+
+### GSEA Bar Plots
+
+```{r}
+library(readxl)
+
+WtT3dGO <- read_excel("/Users/kevinkapner/Documents/Projects/KimmelmanNYU_2019_copy/output/rna-seq/broadGSEA/pre-ranked/WT_T_3D_GO.GseaPreranked.1580321263779/gsea_report_for_na_neg_1580321263779.xls")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
